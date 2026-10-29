@@ -9,7 +9,7 @@ st.set_page_config(
 
 st.title("🤝 Conciliador Automático de Facturas y Retenciones")
 st.markdown(
-    "Subí el PDF de Coopagro y el sistema detectará automáticamente qué facturas tienen retenciones asociadas y cuáles están pendientes o sin retenciones."
+    "Subí el PDF de Coopagro para extraer los comprobantes y detectar retenciones faltantes."
 )
 
 st.sidebar.header("Carga de Archivo")
@@ -18,145 +18,163 @@ pdf_subido = st.sidebar.file_uploader(
 )
 
 
-def extraer_texto_y_tablas(archivo_pdf):
-  filas = []
+def procesar_pdf_coopagro(archivo_pdf):
+  filas_totales = []
   with pdfplumber.open(archivo_pdf) as pdf:
     for pagina in pdf.pages:
-      tabla = pagina.extract_tables()
-      for t in tabla:
-        for row in t:
-          row_clean = [c.strip() if c else "" for c in row]
-          if any(row_clean):
-            filas.append(row_clean)
-  return filas
+      tablas = pagina.extract_tables()
+      for tabla in tablas:
+        for fila in tabla:
+          # Limpiar espacios en blanco
+          fila_limpia = [c.strip() if c else "" for c in fila]
+          if any(fila_limpia):
+            filas_totales.append(fila_limpia)
+  return filas_totales
 
 
 if pdf_subido is not None:
-  datos = extraer_texto_y_tablas(pdf_subido)
+  datos_brutos = procesar_pdf_coopagro(pdf_subido)
 
-  if datos:
-    facturas_dict = {}
-    retenciones_lista = []
+  if datos_brutos:
+    # Buscamos en qué fila están los nombres de las columnas reales
+    idx_encabezado = -1
+    for i, fila in enumerate(datos_brutos):
+      fila_texto = " ".join(fila)
+      if "Tipo Comprobante" in fila_texto or "Nro. Comprobante" in fila_texto:
+        idx_encabezado = i
+        break
 
-    # Barrido inteligente de filas para extraer comprobantes y retenciones
-    for r in datos:
-      texto_fila = " | ".join(r)
+    if idx_encabezado != -1:
+      headers = datos_brutos[idx_encabezado]
+      filas_datos = datos_brutos[idx_encabezado + 1 :]
 
-      # Omitir cabeceras o totales
-      if any(
-          x in texto_fila
-          for x in [
-              "SALDO ANTERIOR",
-              "Saldo entre Fechas",
-              "Tipo Comprobante",
-              "Resumen de Cuenta",
-          ]
-      ):
-        continue
+      # Normalizar la longitud de las filas para que coincidan con los headers
+      filas_normalizadas = []
+      for f in filas_datos:
+        if len(f) < len(headers):
+          f.extend([""] * (len(headers) - len(f)))
+        elif len(f) > len(headers):
+          f = f[: len(headers)]
+        filas_normalizadas.append(f)
 
-      # Detectar Facturas (ej: Factura A Crédito MiPyme 0079-00000038)
-      if "Factura" in texto_fila and "0079-" in texto_fila:
-        match_nro = re.search(r"0079-\d+", texto_fila)
-        match_montos = re.findall(r"\d{1,3}(?:\.\d{3})*,\d{2}", texto_fila)
-        if match_nro and match_montos:
-          nro_factura = match_nro.group(0)
-          # Tomamos el primer monto relevante como importe
-          importe = float(match_montos[0].replace(".", "").replace(",", "."))
-          facturas_dict[nro_factura] = {
-              "Factura": nro_factura,
-              "Importe": importe,
-              "Detalle": texto_fila,
-          }
+      df = pd.DataFrame(filas_normalizadas, columns=headers)
 
-      # Detectar Retenciones (S.U.S.S o IVA) y su asociación (ej: s/FC 79-38)
-      if (
-          "Retención" in texto_fila
-          or "Retencion" in texto_fila
-          or "S.U.S.S" in texto_fila
-          or "IVA" in texto_fila
-      ):
-        match_asoc = re.search(r"79-?\d+", texto_fila)
-        match_montos = re.findall(r"\d{1,3}(?:\.\d{3})*,\d{2}", texto_fila)
-        if match_asoc and match_montos:
-          fc_asociada = match_asoc.group(0)
-          monto_ret = float(
-              match_montos[0].replace(".", "").replace(",", ".")
-          )
-          retenciones_lista.append({
-              "Asociada_A": fc_asociada,
-              "Monto": monto_ret,
-              "Texto": texto_fila,
-          })
+      # Limpiar columnas vacías o con saltos de línea en los nombres
+      df = df.loc[:, df.columns != ""]
+      df.columns = [c.replace("\n", " ").strip() for c in df.columns]
 
-    st.subheader("📊 Resultado del Análisis de Retenciones")
+      st.success("¡Datos estructurados con éxito desde el PDF!")
 
-    if facturas_dict:
+      with st.expander("🔍 Ver tabla limpia detectada"):
+        st.dataframe(df.head(15), use_container_width=True)
+
+      # Filtrar columnas clave (buscando nombres aproximados)
+      col_tipo = next(
+          (c for c in df.columns if "Tipo Comprobante" in c), df.columns[2]
+      )
+      col_nro = next(
+          (c for c in df.columns if "Nro." in c or "Comprobante" in c),
+          df.columns[3],
+      )
+      col_detalle = next((c for c in df.columns if "Detalle" in c), df.columns[4])
+      col_debe = next((c for c in df.columns if "Debe" in c), df.columns[5])
+      col_haber = next((c for c in df.columns if "Haber" in c), df.columns[6])
+
+      # Separar Facturas y Retenciones
+      facturas = df[
+          df[col_tipo].str.contains("Factura", case=False, na=False)
+      ].copy()
+      retenciones = df[
+          df[col_tipo].str.contains("Retención|Retencion", case=False, na=False)
+      ].copy()
+
+      st.subheader("📊 Diagnóstico de Retenciones por Factura")
+
       reporte = []
-      for nro, info in facturas_dict.items():
-        # Extraemos el número corto de la factura (ej: 38 de 0079-00000038)
-        nro_corto = nro.split("-")[-1]
 
-        # Buscamos retenciones asociadas a esta factura
-        suss = sum(
-            r["Monto"]
-            for r in retenciones_lista
-            if nro_corto in r["Asociada_A"]
-            and ("SUSS" in r["Texto"] or "S.U.S.S" in r["Texto"])
-        )
-        iva = sum(
-            r["Monto"]
-            for r in retenciones_lista
-            if nro_corto in r["Asociada_A"] and "IVA" in r["Texto"]
-        )
+      for _, fac in facturas.iterrows():
+        nro_factura_completo = str(fac[col_nro])
+        # Extraer número corto (ej: 38 de 0079-00000038)
+        match_nro = re.search(r"0079-(\d+)", nro_factura_completo)
+        if not match_nro:
+          continue
 
-        total_retenciones = suss + iva
+        nro_corto = str(int(match_nro.group(1)))  # quita ceros a la izquierda
 
-        # Estado de alerta si no tiene retenciones cargadas
+        # Buscar retenciones asociadas en el campo detalle (ej: "79-38" o "79- 38")
+        suss_total = 0
+        iva_total = 0
+
+        for _, ret in retenciones.iterrows():
+          det_ret = str(ret[col_detalle])
+          if nro_corto in det_ret:
+            # Parsear monto de haber o debe según corresponda
+            monto_str = (
+                str(ret[col_haber])
+                if str(ret[col_haber]) not in ["", "0", "0.00"]
+                else str(ret[col_debe])
+            )
+            monto_str = (
+                monto_str.replace(".", "")
+                .replace(",", ".")
+                .replace("-", "")
+            )
+            try:
+              monto = float(monto_str)
+            except ValueError:
+              monto = 0.0
+
+            if "SUSS" in ret[col_tipo] or "S.U.S.S" in det_ret:
+              suss_total += monto
+            elif "IVA" in ret[col_tipo] or "IVA" in det_ret:
+              iva_total += monto
+
+        total_ret = suss_total + iva_total
         estado = (
-            "⚠️ Faltan Cargar Retenciones"
-            if total_retenciones == 0
-            else "✅ Retenciones OK"
+            "⚠️ Falta Retención" if total_ret == 0 else "✅ Retenciones OK"
         )
 
         reporte.append({
-            "Factura": nro,
-            "Importe Factura ($)": info["Importe"],
-            "Retención S.U.S.S. ($)": suss,
-            "Retención IVA ($)": iva,
-            "Total Retenciones ($)": total_retenciones,
+            "Factura": nro_factura_completo,
+            "Detalle / Producto": str(fac[col_detalle]),
+            "Retención S.U.S.S. ($)": suss_total,
+            "Retención IVA ($)": iva_total,
+            "Total Retenciones ($)": total_ret,
             "Estado": estado,
         })
 
-      df_final = pd.DataFrame(reporte)
+      if reporte:
+        df_reporte = pd.DataFrame(reporte)
 
-      # Mostrar métricas rápidas
-      col1, col2 = st.columns(2)
-      col1.metric("Total Facturas Detectadas", len(df_final))
-      col2.metric(
-          "Facturas sin Retenciones Detectadas",
-          len(df_final[df_final["Total Retenciones ($)"] == 0]),
-      )
+        col1, col2 = st.columns(2)
+        col1.metric("Total Facturas Analizadas", len(df_reporte))
+        col2.metric(
+            "Facturas sin Retenciones",
+            len(df_reporte[df_reporte["Total Retenciones ($)"] == 0]),
+        )
 
-      # Mostrar tabla interactiva con formato
-      st.dataframe(df_final, use_container_width=True)
+        st.dataframe(df_reporte, use_container_width=True)
 
-      # Opción de descarga a CSV
-      csv = df_final.to_csv(index=False).encode("utf-8")
-      st.download_button(
-          label="📥 Descargar Reporte en CSV",
-          data=csv,
-          file_name="conciliacion_retenciones.csv",
-          mime="text/csv",
-      )
+        # Botón de descarga
+        csv = df_reporte.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "📥 Descargar Reporte de Control",
+            csv,
+            "control_retenciones.csv",
+            "text/csv",
+        )
+      else:
+        st.warning(
+            "No se pudieron matchear facturas con retenciones. Verificá que"
+            " el PDF contenga ambas en el período seleccionado."
+        )
 
     else:
-      st.warning(
-          "No se pudieron estructurar las facturas automáticamente. Podés"
-          " revisar los datos en bruto debajo:"
+      st.error(
+          "No se encontró la cabecera de la tabla en el PDF. Asegurate de que"
+          " sea el reporte completo de cuenta corriente."
       )
-      st.dataframe(pd.DataFrame(datos))
-
   else:
-    st.warning("El archivo PDF está vacío o no contiene texto legible.")
+    st.warning("El archivo PDF está vacío.")
 else:
-  st.info("👈 Sube tu archivo PDF en la barra lateral para empezar.")
+  st.info("👈 Subí tu archivo PDF en la barra lateral para comenzar.")
