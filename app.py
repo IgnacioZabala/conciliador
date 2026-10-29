@@ -6,7 +6,7 @@ st.set_page_config(
     page_title="Conciliador de Retenciones - Coopagro", layout="wide"
 )
 
-st.title("🤝 Conciliador Automático de Facturas y Retenciones (Excel / HTML)")
+st.title("🤝 Conciliador Automático de Facturas y Retenciones")
 st.markdown(
     "Subí el archivo exportado desde el sistema de Coopagro para detectar de"
     " forma automática qué facturas tienen sus retenciones asociadas y cuáles"
@@ -21,7 +21,6 @@ archivo_subido = st.sidebar.file_uploader(
 
 def procesar_archivo_coopagro(archivo):
   try:
-    # Leemos las tablas HTML internas que genera el sistema de Coopagro
     tablas = pd.read_html(archivo, flavor="lxml")
     df_encontrado = None
     for t in tablas:
@@ -51,7 +50,7 @@ if archivo_subido is not None:
   df = procesar_archivo_coopagro(archivo_subido)
 
   if df is not None and not df.empty:
-    # Limpiar nombres de columnas y saltos de línea
+    # Limpiar nombres de columnas
     df.columns = [
         str(c).replace("\n", " ").strip() for c in df.columns
     ]
@@ -59,19 +58,20 @@ if archivo_subido is not None:
     with st.expander("🔍 Ver datos brutos importados"):
       st.dataframe(df.head(15), use_container_width=True)
 
-    # Identificar columnas clave de forma flexible
-    col_tipo = next(
-        (c for c in df.columns if "Tipo Comprobante" in c), df.columns[5]
-    )
-    col_nro = next(
-        (c for c in df.columns if "Nro." in c or "Comprobante" in c),
-        df.columns[6],
-    )
-    col_detalle = next((c for c in df.columns if "Detalle" in c), df.columns[7])
-    col_debe = next(
-        (c for c in df.columns if c in ["Debe", "Importe"]), df.columns[8]
-    )
-    col_haber = next((c for c in df.columns if "Haber" in c), df.columns[9])
+    # Ubicar columnas de forma estricta según el reporte real de Coopagro
+    try:
+      col_tipo = next(c for c in df.columns if "Tipo Comprobante" in c)
+      col_nro = next(c for c in df.columns if "Nro. Comprobante" in c)
+      col_detalle = next(c for c in df.columns if c == "Detalle")
+      col_debe = next(c for c in df.columns if c == "Debe")
+      col_haber = next(c for c in df.columns if c == "Haber")
+    except StopIteration:
+      # Fallback por índice si falla la búsqueda por nombre exacto
+      col_tipo = df.columns[5]
+      col_nro = df.columns[6]
+      col_detalle = df.columns[7]
+      col_debe = df.columns[8]
+      col_haber = df.columns[9]
 
     # Separar Facturas y Retenciones
     facturas = df[
@@ -88,21 +88,23 @@ if archivo_subido is not None:
     reporte = []
 
     for _, fac in facturas.iterrows():
-      nro_factura_completo = str(fac[col_nro])
-      # Extraer número corto (ej: 38 de 0079-00000038)
+      nro_factura_completo = str(fac[col_nro])  # Ej: 0079-00000038
       match_nro = re.search(r"0079-(\d+)", nro_factura_completo)
       if not match_nro:
         continue
 
+      # Número corto limpio (ej: 38)
       nro_corto = str(int(match_nro.group(1)))
 
       suss_total = 0.0
       iva_total = 0.0
 
-      # Buscar retenciones asociadas en el detalle (ej. "79-38")
+      # Buscar retenciones asociadas en el campo Detalle (ej. "79-38")
       for _, ret in retenciones.iterrows():
         det_ret = str(ret[col_detalle])
-        if nro_corto in det_ret:
+        # Buscamos si el número de factura aparece en la referencia (ej. 79-38 o similar)
+        if f"79-{nro_corto}" in det_ret or f"79-{match_nro.group(1)}" in det_ret:
+          # El importe de la retención suele venir en Haber o Debe
           val_str = str(ret[col_haber])
           if val_str in ["nan", "None", "", "0", "0.00"]:
             val_str = str(ret[col_debe])
@@ -118,9 +120,10 @@ if archivo_subido is not None:
           except ValueError:
             monto = 0.0
 
-          if "SUSS" in str(ret[col_tipo]) or "S.U.S.S" in det_ret:
+          tipo_ret = str(ret[col_tipo]).upper()
+          if "S.U.S.S" in tipo_ret or "SUSS" in det_ret.upper():
             suss_total += monto
-          elif "IVA" in str(ret[col_tipo]) or "IVA" in det_ret:
+          elif "IVA" in tipo_ret or "IVA" in det_ret.upper():
             iva_total += monto
 
       # Importe nominal de la factura
