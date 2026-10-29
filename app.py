@@ -21,9 +21,8 @@ archivo_subido = st.sidebar.file_uploader(
 
 def procesar_archivo_coopagro(archivo):
   try:
-    # Como los archivos .xls de estos sistemas son tablas HTML internas, usamos read_html
-    tablas = pd.read_html(archivo)
-    # Buscamos la tabla que contenga las columnas clave del resumen
+    # Leemos las tablas HTML internas que genera el sistema de Coopagro
+    tablas = pd.read_html(archivo, flavor="lxml")
     df_encontrado = None
     for t in tablas:
       columnas_texto = " ".join([str(c) for c in t.columns])
@@ -40,7 +39,6 @@ def procesar_archivo_coopagro(archivo):
         df_encontrado = t
         break
     if df_encontrado is None and len(tablas) > 0:
-      # Si no encuentra coincidencia exacta, toma la tabla más grande
       df_encontrado = max(tablas, key=len)
 
     return df_encontrado
@@ -70,7 +68,9 @@ if archivo_subido is not None:
         df.columns[6],
     )
     col_detalle = next((c for c in df.columns if "Detalle" in c), df.columns[7])
-    col_debe = next((c for c in df.columns if c in ["Debe", "Importe"]), df.columns[8])
+    col_debe = next(
+        (c for c in df.columns if c in ["Debe", "Importe"]), df.columns[8]
+    )
     col_haber = next((c for c in df.columns if "Haber" in c), df.columns[9])
 
     # Separar Facturas y Retenciones
@@ -89,25 +89,22 @@ if archivo_subido is not None:
 
     for _, fac in facturas.iterrows():
       nro_factura_completo = str(fac[col_nro])
-      # Extraer número corto (ej: 38 de 0079-00000038 o 79-38)
+      # Extraer número corto (ej: 38 de 0079-00000038)
       match_nro = re.search(r"0079-(\d+)", nro_factura_completo)
       if not match_nro:
         continue
 
-      nro_corto = str(
-          int(match_nro.group(1))
-      )  # Normaliza quitando ceros a la izquierda
+      nro_corto = str(int(match_nro.group(1)))
 
       suss_total = 0.0
       iva_total = 0.0
 
-      # Buscar retenciones asociadas en el detalle (ej. "79-38" o referencias cruzadas)
+      # Buscar retenciones asociadas en el detalle (ej. "79-38")
       for _, ret in retenciones.iterrows():
         det_ret = str(ret[col_detalle])
         if nro_corto in det_ret:
-          # Obtener el monto (puede estar en Debe o Haber según cómo lo expida el sistema)
           val_str = str(ret[col_haber])
-          if val_str in ["nan", "None", "", "0", "0.00", "nan"]:
+          if val_str in ["nan", "None", "", "0", "0.00"]:
             val_str = str(ret[col_debe])
 
           val_str = (
